@@ -4,7 +4,7 @@
 ### AnyKernel setup
 # begin properties
 properties() { '
-kernel.string=Rashoumon Kernel 1.0 by Cexary
+kernel.string=Redline Kernel by Hanamizaki
 do.devicecheck=0
 do.modules=0
 do.systemless=1
