@@ -555,11 +555,16 @@ extern int
 register_cpu_cycle_counter_cb(struct cpu_cycle_counter_cb *cb);
 extern void
 sched_update_cpu_freq_min_max(const cpumask_t *cpus, u32 fmin, u32 fmax);
-extern void free_task_load_ptrs(struct task_struct *p);
 extern int set_task_boost(int boost, u64 period);
 extern void walt_update_cluster_topology(void);
 
-#define RAVG_HIST_SIZE_MAX  5
+/*
+ * RAVG_HIST_SHIFT trick can only be used if RAVG_HIST_SIZE is a power of 2.
+ */
+#define RAVG_HIST_SIZE 8
+#define RAVG_HIST_SHIFT 3
+#define RAVG_HIST_MASK (RAVG_HIST_SIZE - 1)
+
 #define NUM_BUSY_BUCKETS 10
 
 #define WALT_LOW_LATENCY_PROCFS	BIT(0)
@@ -602,11 +607,12 @@ struct walt_task_struct {
 	u64				mark_start;
 	u32				sum, demand;
 	u32				coloc_demand;
-	u32				sum_history[RAVG_HIST_SIZE_MAX];
-	u32				*curr_window_cpu, *prev_window_cpu;
+	u32				sum_history[RAVG_HIST_SIZE];
+	u32				curr_window_cpu[CONFIG_NR_CPUS], prev_window_cpu[CONFIG_NR_CPUS];
 	u32				curr_window, prev_window;
 	u32				pred_demand;
 	u8				busy_buckets[NUM_BUSY_BUCKETS];
+	u16				bucket_bitmask;
 	u16				demand_scaled;
 	u16				pred_demand_scaled;
 	u64				active_time;
@@ -627,6 +633,7 @@ struct walt_task_struct {
 	u64				cpu_cycles;
 	cpumask_t			cpus_requested;
 	bool				iowaited;
+	int				cidx;
 };
 
 #else
@@ -637,8 +644,6 @@ register_cpu_cycle_counter_cb(struct cpu_cycle_counter_cb *cb)
 {
 	return 0;
 }
-
-static inline void free_task_load_ptrs(struct task_struct *p) { }
 
 static inline void sched_update_cpu_freq_min_max(const cpumask_t *cpus,
 					u32 fmin, u32 fmax) { }
@@ -1172,7 +1177,7 @@ struct task_struct {
 	struct held_lock		held_locks[MAX_LOCK_DEPTH];
 #endif
 
-#ifdef CONFIG_UBSAN
+#if defined(CONFIG_UBSAN) && !defined(CONFIG_UBSAN_TRAP)
 	unsigned int			in_ubsan;
 #endif
 
@@ -1776,7 +1781,6 @@ extern int task_can_attach(struct task_struct *p, const struct cpumask *cs_cpus_
 #ifdef CONFIG_SMP
 extern void do_set_cpus_allowed(struct task_struct *p, const struct cpumask *new_mask);
 extern int set_cpus_allowed_ptr(struct task_struct *p, const struct cpumask *new_mask);
-extern bool cpupri_check_rt(void);
 #else
 static inline void do_set_cpus_allowed(struct task_struct *p, const struct cpumask *new_mask)
 {
@@ -1786,10 +1790,6 @@ static inline int set_cpus_allowed_ptr(struct task_struct *p, const struct cpuma
 	if (!cpumask_test_cpu(0, new_mask))
 		return -EINVAL;
 	return 0;
-}
-static inline bool cpupri_check_rt(void)
-{
-	return false;
 }
 #endif
 

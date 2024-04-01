@@ -1544,7 +1544,6 @@ struct sched_group_capacity {
 	unsigned long		capacity;
 	unsigned long		min_capacity;		/* Min per-CPU capacity in group */
 	unsigned long		max_capacity;		/* Max per-CPU capacity in group */
-	unsigned long		next_update;
 	int			imbalance;		/* XXX unrelated to capacity but shared group state */
 
 #ifdef CONFIG_SCHED_DEBUG
@@ -2480,11 +2479,6 @@ extern void set_rq_online (struct rq *rq);
 extern void set_rq_offline(struct rq *rq);
 extern bool sched_smp_initialized;
 
-/*
- * task_may_not_preempt - check whether a task may not be preemptible soon
- */
-extern bool task_may_not_preempt(struct task_struct *task, int cpu);
-
 #else /* CONFIG_SMP */
 
 /*
@@ -2649,20 +2643,11 @@ DECLARE_PER_CPU(struct update_util_data __rcu *, cpufreq_update_util_data);
 static inline void cpufreq_update_util(struct rq *rq, unsigned int flags)
 {
 	struct update_util_data *data;
-	u64 clock;
-
-#ifdef CONFIG_SCHED_WALT
-	if (!(flags & SCHED_CPUFREQ_WALT))
-		return;
-	clock = sched_ktime_clock();
-#else
-	clock = rq_clock(rq);
-#endif
 
 	data = rcu_dereference_sched(*per_cpu_ptr(&cpufreq_update_util_data,
 					cpu_of(rq)));
 	if (data)
-		data->func(data, clock, flags);
+		data->func(data, rq_clock(rq), flags);
 }
 #else
 static inline void cpufreq_update_util(struct rq *rq, unsigned int flags) {}
@@ -3088,13 +3073,21 @@ static inline int same_freq_domain(int src_cpu, int dst_cpu)
 extern enum sched_boost_policy boost_policy;
 static inline enum sched_boost_policy sched_boost_policy(void)
 {
+#ifdef CONFIG_SCHED_WALT_ORIG
 	return boost_policy;
+#else
+	return SCHED_BOOST_NONE;
+#endif
 }
 
 extern unsigned int sched_boost_type;
 static inline int sched_boost(void)
 {
+#ifdef CONFIG_SCHED_WALT_ORIG
 	return sched_boost_type;
+#else
+	return NO_BOOST;
+#endif
 }
 
 static inline bool rt_boost_on_big(void)
@@ -3422,7 +3415,7 @@ extern struct task_struct *find_process_by_pid(pid_t pid);
 extern void enqueue_task_core(struct rq *rq, struct task_struct *p, int flags);
 extern void dequeue_task_core(struct rq *rq, struct task_struct *p, int flags);
 
-#if defined(CONFIG_SCHED_WALT) && defined(CONFIG_UCLAMP_TASK_GROUP)
+#if defined(CONFIG_SCHED_WALT_ORIG) && defined(CONFIG_SCHED_WALT) && defined(CONFIG_UCLAMP_TASK_GROUP)
 extern void walt_init_sched_boost(struct task_group *tg);
 #else
 static inline void walt_init_sched_boost(struct task_group *tg) {}

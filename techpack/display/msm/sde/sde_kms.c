@@ -2249,7 +2249,7 @@ static int sde_kms_postinit(struct msm_kms *kms)
 	drm_for_each_connector_iter(conn, &conn_iter)
 		sde_connector_post_init(dev, conn);
 	drm_connector_list_iter_end(&conn_iter);
-	return rc;
+	return 0;
 }
 
 static long sde_kms_round_pixclk(struct msm_kms *kms, unsigned long rate,
@@ -4005,6 +4005,7 @@ retry:
 			continue;
 
 		lp = sde_connector_get_lp(conn);
+#ifndef CONFIG_WT_QGKI
 		if (lp == SDE_MODE_DPMS_LP1) {
 			/* transition LP1->LP2 on pm suspend */
 			ret = sde_connector_set_property_for_commit(conn, state,
@@ -4016,6 +4017,7 @@ retry:
 				goto unlock;
 			}
 		}
+#endif
 
 		if (lp != SDE_MODE_DPMS_LP2) {
 			/* force CRTC to be inactive */

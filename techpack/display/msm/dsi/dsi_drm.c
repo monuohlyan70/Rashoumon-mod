@@ -7,6 +7,8 @@
 
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_atomic.h>
+#include <drm/drm_notifier.h>
+#include <linux/notifier.h>
 
 #include "msm_kms.h"
 #include "sde_connector.h"
@@ -21,6 +23,37 @@
 #define DEFAULT_PANEL_JITTER_DENOMINATOR	1
 #define DEFAULT_PANEL_JITTER_ARRAY_SIZE		2
 #define DEFAULT_PANEL_PREFILL_LINES	25
+
+static BLOCKING_NOTIFIER_HEAD(drm_notifier_list);
+
+/*
+ * drm_register_client - register a client notifier
+ * @nb: notifier block to callback when event happens
+ */
+int drm_register_client(struct notifier_block *nb)
+{
+	return blocking_notifier_chain_register(&drm_notifier_list, nb);
+}
+EXPORT_SYMBOL(drm_register_client);
+
+/*
+ * drm_unregister_client - unregister a client notifier
+ * @nb: notifier block to callback when event happens
+ */
+int drm_unregister_client(struct notifier_block *nb)
+{
+	return blocking_notifier_chain_unregister(&drm_notifier_list, nb);
+}
+EXPORT_SYMBOL(drm_unregister_client);
+
+/*
+ * drm_notifier_call_chain - notify clients of drm_event
+ */
+int drm_notifier_call_chain(unsigned long val, void *v)
+{
+	return blocking_notifier_call_chain(&drm_notifier_list, val, v);
+}
+EXPORT_SYMBOL(drm_notifier_call_chain);
 
 static struct dsi_display_mode_priv_info default_priv_info = {
 	.panel_jitter_numer = DEFAULT_PANEL_JITTER_NUMERATOR,
@@ -94,8 +127,6 @@ static void convert_to_dsi_mode(const struct drm_display_mode *drm_mode,
 void dsi_convert_to_drm_mode(const struct dsi_display_mode *dsi_mode,
 				struct drm_display_mode *drm_mode)
 {
-	bool video_mode = (dsi_mode->panel_mode == DSI_OP_VIDEO_MODE);
-
 	memset(drm_mode, 0, sizeof(*drm_mode));
 
 	drm_mode->hdisplay = dsi_mode->timing.h_active;
@@ -144,10 +175,7 @@ void dsi_convert_to_drm_mode(const struct dsi_display_mode *dsi_mode,
 		drm_mode->flags |= DRM_MODE_FLAG_CMD_MODE_PANEL;
 
 	/* set mode name */
-	snprintf(drm_mode->name, DRM_DISPLAY_MODE_LEN, "%dx%dx%dx%d%s",
-			drm_mode->hdisplay, drm_mode->vdisplay,
-			drm_mode->vrefresh, drm_mode->clock,
-			video_mode ? "vid" : "cmd");
+	*drm_mode->name = '\0';
 }
 
 static int dsi_bridge_attach(struct drm_bridge *bridge)
@@ -169,6 +197,9 @@ static void dsi_bridge_pre_enable(struct drm_bridge *bridge)
 {
 	int rc = 0;
 	struct dsi_bridge *c_bridge = to_dsi_bridge(bridge);
+	struct drm_notify_data g_notify_data;
+	int event = DRM_BLANK_UNBLANK;
+	g_notify_data.data = &event;
 
 	if (!bridge) {
 		DSI_ERR("Invalid params\n");
@@ -191,6 +222,8 @@ static void dsi_bridge_pre_enable(struct drm_bridge *bridge)
 		       c_bridge->id, rc);
 		return;
 	}
+
+	drm_notifier_call_chain(DRM_EARLY_EVENT_BLANK, &g_notify_data);
 
 	if (c_bridge->dsi_mode.dsi_mode_flags &
 		(DSI_MODE_FLAG_SEAMLESS | DSI_MODE_FLAG_VRR |
@@ -217,6 +250,8 @@ static void dsi_bridge_pre_enable(struct drm_bridge *bridge)
 		(void)dsi_display_unprepare(c_bridge->display);
 	}
 	SDE_ATRACE_END("dsi_display_enable");
+
+	drm_notifier_call_chain(DRM_EVENT_BLANK, &g_notify_data);
 
 	rc = dsi_display_splash_res_cleanup(c_bridge->display);
 	if (rc)
@@ -295,11 +330,16 @@ static void dsi_bridge_post_disable(struct drm_bridge *bridge)
 {
 	int rc = 0;
 	struct dsi_bridge *c_bridge = to_dsi_bridge(bridge);
+	struct drm_notify_data g_notify_data;
+	int event = DRM_BLANK_POWERDOWN;
+	g_notify_data.data = &event;
 
 	if (!bridge) {
 		DSI_ERR("Invalid params\n");
 		return;
 	}
+
+	drm_notifier_call_chain(DRM_EARLY_EVENT_BLANK, &g_notify_data);
 
 	SDE_ATRACE_BEGIN("dsi_bridge_post_disable");
 	SDE_ATRACE_BEGIN("dsi_display_disable");
@@ -320,6 +360,8 @@ static void dsi_bridge_post_disable(struct drm_bridge *bridge)
 		return;
 	}
 	SDE_ATRACE_END("dsi_bridge_post_disable");
+
+	drm_notifier_call_chain(DRM_EVENT_BLANK, &g_notify_data);
 }
 
 static void dsi_bridge_mode_set(struct drm_bridge *bridge,
@@ -966,6 +1008,13 @@ int dsi_connector_get_modes(struct drm_connector *connector, void *data,
 
 	edid.width_cm = (connector->display_info.width_mm) / 10;
 	edid.height_cm = (connector->display_info.height_mm) / 10;
+
+#ifdef CONFIG_WT_QGKI
+	if (connector->display_info.height_mm > 1000) {
+		edid.width_cm = (connector->display_info.width_mm) / 100;
+		edid.height_cm = (connector->display_info.height_mm) / 100;
+	}
+#endif
 
 	dsi_drm_update_dtd(&edid, modes, count);
 	dsi_drm_update_checksum(&edid);

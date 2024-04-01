@@ -383,14 +383,14 @@ static struct dev_config aux_pcm_tx_cfg[] = {
 /* Default configuration of MI2S channels */
 static struct dev_config mi2s_rx_cfg[] = {
 	[PRIM_MI2S] = {SAMPLING_RATE_48KHZ, SNDRV_PCM_FORMAT_S16_LE, 2},
-	[SEC_MI2S]  = {SAMPLING_RATE_48KHZ, SNDRV_PCM_FORMAT_S16_LE, 2},
+	[SEC_MI2S]  = {SAMPLING_RATE_48KHZ, SNDRV_PCM_FORMAT_S32_LE, 2},
 	[TERT_MI2S] = {SAMPLING_RATE_48KHZ, SNDRV_PCM_FORMAT_S16_LE, 2},
 	[QUAT_MI2S] = {SAMPLING_RATE_48KHZ, SNDRV_PCM_FORMAT_S16_LE, 2},
 };
 
 static struct dev_config mi2s_tx_cfg[] = {
 	[PRIM_MI2S] = {SAMPLING_RATE_48KHZ, SNDRV_PCM_FORMAT_S16_LE, 1},
-	[SEC_MI2S]  = {SAMPLING_RATE_48KHZ, SNDRV_PCM_FORMAT_S16_LE, 1},
+	[SEC_MI2S]  = {SAMPLING_RATE_48KHZ, SNDRV_PCM_FORMAT_S32_LE, 2},
 	[TERT_MI2S] = {SAMPLING_RATE_48KHZ, SNDRV_PCM_FORMAT_S16_LE, 1},
 	[QUAT_MI2S] = {SAMPLING_RATE_48KHZ, SNDRV_PCM_FORMAT_S16_LE, 1},
 };
@@ -735,9 +735,9 @@ static struct wcd_mbhc_config wcd_mbhc_cfg = {
 	.swap_gnd_mic = NULL,
 	.hs_ext_micbias = true,
 	.key_code[0] = KEY_MEDIA,
-	.key_code[1] = KEY_VOICECOMMAND,
-	.key_code[2] = KEY_VOLUMEUP,
-	.key_code[3] = KEY_VOLUMEDOWN,
+	.key_code[1] = KEY_VOLUMEUP,
+	.key_code[2] = KEY_VOLUMEDOWN,
+	.key_code[3] = 0,
 	.key_code[4] = 0,
 	.key_code[5] = 0,
 	.key_code[6] = 0,
@@ -4757,8 +4757,8 @@ static void *def_wcd_mbhc_cal(void)
 		(sizeof(btn_cfg->_v_btn_low[0]) * btn_cfg->num_btn);
 
 	btn_high[0] = 75;
-	btn_high[1] = 150;
-	btn_high[2] = 237;
+	btn_high[1] = 225;
+	btn_high[2] = 450;
 	btn_high[3] = 500;
 	btn_high[4] = 500;
 	btn_high[5] = 500;
@@ -5209,6 +5209,41 @@ static struct snd_soc_dai_link msm_common_dai_links[] = {
 		.ignore_suspend = 1,
 		.ignore_pmdown_time = 1,
 		SND_SOC_DAILINK_REG(tert_mi2s_tx_hostless),
+	},
+	{/* hw:x,33 */
+		.name = "Secondary MI2S TX_Hostless",
+		.stream_name = "Secondary MI2S_TX Hostless Capture",
+		.dynamic = 1,
+		.dpcm_capture = 1,
+		.trigger = {SND_SOC_DPCM_TRIGGER_POST,
+				SND_SOC_DPCM_TRIGGER_POST},
+		.no_host_mode = SND_SOC_DAI_LINK_NO_HOST,
+		.ignore_suspend = 1,
+		.ignore_pmdown_time = 1,
+		SND_SOC_DAILINK_REG(sec_mi2s_tx_hostless),
+	},
+	{/* hw:x,34 */
+		.name = "TX4_CDC_DMA Hostless",
+		.stream_name = "TX4_CDC_DMA Hostless",
+		.dynamic = 1,
+		.dpcm_capture = 1,
+		.trigger = {SND_SOC_DPCM_TRIGGER_POST,
+			    SND_SOC_DPCM_TRIGGER_POST},
+		.no_host_mode = SND_SOC_DAI_LINK_NO_HOST,
+		.ignore_suspend = 1,
+		SND_SOC_DAILINK_REG(tx4_cdcdma_hostless),
+	},
+	{/* hw:x,35 */
+		.name = "Secondary MI2S_RX Hostless",
+		.stream_name = "Secondary MI2S_RX Hostless Playback",
+		.dynamic = 1,
+		.dpcm_playback = 1,
+		.trigger = {SND_SOC_DPCM_TRIGGER_POST,
+				SND_SOC_DPCM_TRIGGER_POST},
+		.no_host_mode = SND_SOC_DAI_LINK_NO_HOST,
+		.ignore_suspend = 1,
+		.ignore_pmdown_time = 1,
+		SND_SOC_DAILINK_REG(sec_mi2s_rx_hostless),
 	},
 };
 
@@ -5896,6 +5931,48 @@ static struct snd_soc_dai_link msm_va_cdc_dma_be_dai_links[] = {
 	},
 };
 
+#ifdef CONFIG_SND_SOC_FS19XX
+#include "codecs/fs19xx/fsm_public.h"
+
+static struct snd_soc_dai_link_component sec_mi2s_fsm_codec[] = {
+	{
+		.name = "fs19xx.3-0036",
+		.of_node = NULL,
+		.dai_name = "fs19xx-aif"
+	},
+};
+
+static int fsm_update_dai_links(struct snd_soc_dai_link *dailink, int count)
+{
+	int i;
+	fsm_config_t *cfg = fsm_get_config();
+
+	if (!dailink || !cfg || cfg->dev_count <= 0) {
+		pr_info("%s(): not have foursemi device", __func__);
+		return 0;
+	}
+
+	for (i = 0; i < count; i++) {
+		// TODO:
+		// 1. make sure it had qcom,mi2s-audio-intf; in dts sound card
+		// 2. make sure be dai have special mi2s rx&tx, fe dai has tx hostless
+		// 3. replace be_id and cpu_dai_name below for customize
+		if (((MSM_BACKEND_DAI_SECONDARY_MI2S_RX == dailink[i].id) &&
+		     !strcmp(dailink[i].name, LPASS_BE_SEC_MI2S_RX)) ||
+		    ((MSM_BACKEND_DAI_SECONDARY_MI2S_TX == dailink[i].id) &&
+		     !strcmp(dailink[i].name, LPASS_BE_SEC_MI2S_TX))) {
+			pr_info("%s(): update:%s", __func__, dailink[i].name);
+			dailink[i].codecs = sec_mi2s_fsm_codec;
+			dailink[i].num_codecs = ARRAY_SIZE(sec_mi2s_fsm_codec);
+			dailink[i].codecs->dai_name = cfg->codec_dai_name[0];
+			dailink[i].codecs->name = cfg->codec_name[0];
+		}
+	}
+
+	return 0;
+}
+#endif
+
 static struct snd_soc_dai_link msm_afe_rxtx_lb_be_dai_link[] = {
 	{
 		.name = LPASS_BE_AFE_LOOPBACK_TX,
@@ -6286,6 +6363,10 @@ static struct snd_soc_card *populate_snd_card_dailinks(struct device *dev)
 		dailink = msm_stub_dai_links;
 		total_links = len_2;
 	}
+
+#ifdef CONFIG_SND_SOC_FS19XX
+	fsm_update_dai_links(dailink, total_links);
+#endif
 
 	if (card) {
 		card->dai_link = dailink;

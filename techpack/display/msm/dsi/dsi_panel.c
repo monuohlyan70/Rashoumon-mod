@@ -254,6 +254,7 @@ static int dsi_panel_reset(struct dsi_panel *panel)
 		}
 	}
 
+	usleep_range(10000, 10100);
 	if (r_config->count) {
 		rc = gpio_direction_output(r_config->reset_gpio,
 			r_config->sequence[0].level);
@@ -383,12 +384,15 @@ static int dsi_panel_power_off(struct dsi_panel *panel)
 		DSI_DEBUG("TWM Enabled, skip panel power off\n");
 		return rc;
 	}
-	if (gpio_is_valid(panel->reset_config.disp_en_gpio))
-		gpio_set_value(panel->reset_config.disp_en_gpio, 0);
 
 	if (gpio_is_valid(panel->reset_config.reset_gpio) &&
 					!panel->reset_gpio_always_on)
 		gpio_set_value(panel->reset_config.reset_gpio, 0);
+
+	usleep_range(11000, 11010);
+
+	if (gpio_is_valid(panel->reset_config.disp_en_gpio))
+		gpio_set_value(panel->reset_config.disp_en_gpio, 0);
 
 	if (gpio_is_valid(panel->reset_config.lcd_mode_sel_gpio))
 		gpio_set_value(panel->reset_config.lcd_mode_sel_gpio, 0);
@@ -619,13 +623,25 @@ error:
 	return rc;
 }
 
+static int dsi_panel_set_doze(struct dsi_panel *panel, u32 bl_lvl);
+
 int dsi_panel_set_backlight(struct dsi_panel *panel, u32 bl_lvl)
 {
 	int rc = 0;
 	struct dsi_backlight_config *bl = &panel->bl_config;
+	static unsigned long last_stored;
 
 	if (panel->host_config.ext_bridge_mode)
 		return 0;
+
+	/* The panel exits doze on any brightness changes */
+	if (panel->doze_status) {
+		if (bl_lvl) {
+			dsi_panel_set_doze(panel, bl_lvl);
+			bl->bl_level_nodim = bl_lvl;
+		}
+		return 0;
+	}
 
 	DSI_DEBUG("backlight type:%d lvl:%d\n", bl->type, bl_lvl);
 	switch (bl->type) {
@@ -643,6 +659,12 @@ int dsi_panel_set_backlight(struct dsi_panel *panel, u32 bl_lvl)
 	default:
 		DSI_ERR("Backlight type(%d) not supported\n", bl->type);
 		rc = -ENOTSUPP;
+	}
+
+	/* Avoid using dimmed value when calculating doze mode */
+	if (bl_lvl && time_after(jiffies, last_stored + 6 * HZ)) {
+		last_stored = jiffies;
+		bl->bl_level_nodim = bl_lvl;
 	}
 
 	return rc;
@@ -1758,6 +1780,10 @@ const char *cmd_set_prop_map[DSI_CMD_SET_MAX] = {
 	"qcom,mdss-dsi-post-mode-switch-on-command",
 	"qcom,mdss-dsi-qsync-on-commands",
 	"qcom,mdss-dsi-qsync-off-commands",
+	"qcom,mdss-dsi-doze-hbm-command",
+	"qcom,mdss-dsi-doze-lbm-command",
+	"qcom,mdss-dsi-dispparam-bc-120hz-command",
+	"qcom,mdss-dsi-dispparam-bc-60hz-command",
 };
 
 const char *cmd_set_state_map[DSI_CMD_SET_MAX] = {
@@ -1784,6 +1810,10 @@ const char *cmd_set_state_map[DSI_CMD_SET_MAX] = {
 	"qcom,mdss-dsi-post-mode-switch-on-command-state",
 	"qcom,mdss-dsi-qsync-on-commands-state",
 	"qcom,mdss-dsi-qsync-off-commands-state",
+	"qcom,mdss-dsi-doze-hbm-command-state",
+	"qcom,mdss-dsi-doze-lbm-command-state",
+	"qcom,mdss-dsi-dispparam-bc-120hz-command-state",
+	"qcom,mdss-dsi-dispparam-bc-60hz-command-state",
 };
 
 int dsi_panel_get_cmd_pkt_count(const char *data, u32 length, u32 *cnt)
@@ -2445,8 +2475,12 @@ static int dsi_panel_parse_bl_config(struct dsi_panel *panel)
 		panel->bl_config.brightness_max_level = val;
 	}
 
+#ifdef CONFIG_WT_QGKI
+	panel->bl_config.bl_inverted_dbv = true;
+#else
 	panel->bl_config.bl_inverted_dbv = utils->read_bool(utils->data,
 		"qcom,mdss-dsi-bl-inverted-dbv");
+#endif
 
 	state = utils->get_property(utils->data, "qcom,bl-dsc-cmd-state", NULL);
 	if (!state || !strcmp(state, "dsi_hs_mode"))
@@ -3370,6 +3404,25 @@ static int dsi_panel_parse_esd_config(struct dsi_panel *panel)
 
 	esd_config = &panel->esd_config;
 	esd_config->status_mode = ESD_MODE_MAX;
+
+	/* esd-err-flag method will be prefered */
+	esd_config->esd_err_irq_gpio = of_get_named_gpio_flags(
+		panel->panel_of_node, "qcom,esd-err-irq-gpio", 0,
+		(enum of_gpio_flags *)&esd_config->esd_err_irq_flags);
+	if (gpio_is_valid(esd_config->esd_err_irq_gpio)) {
+		esd_config->esd_err_irq =
+			gpio_to_irq(esd_config->esd_err_irq_gpio);
+		rc = gpio_request(esd_config->esd_err_irq_gpio,
+				  "esd_err_irq_gpio");
+		if (rc)
+			pr_err("%s: Failed to get esd irq gpio %d (code: %d)",
+			       __func__, esd_config->esd_err_irq_gpio, rc);
+		else
+			gpio_direction_input(esd_config->esd_err_irq_gpio);
+
+		return 0;
+	}
+
 	esd_config->esd_enabled = utils->read_bool(utils->data,
 		"qcom,esd-check-enabled");
 
@@ -3422,6 +3475,20 @@ static int dsi_panel_parse_esd_config(struct dsi_panel *panel)
 
 error:
 	panel->esd_config.esd_enabled = false;
+	return rc;
+}
+
+static int dsi_panel_parse_doze(struct dsi_panel *panel)
+{
+	int rc;
+	struct dsi_parser_utils *utils = &panel->utils;
+
+	rc = utils->read_u32(utils->data,
+			     "mi,mdss-dsi-doze-hbm-brightness-value",
+			     &panel->doze_hbm_threshold);
+	if (rc)
+		panel->doze_hbm_threshold = 200;
+
 	return rc;
 }
 
@@ -3589,6 +3656,10 @@ struct dsi_panel *dsi_panel_get(struct device *parent,
 	if (rc)
 		DSI_DEBUG("failed to parse esd config, rc=%d\n", rc);
 
+	rc = dsi_panel_parse_doze(panel);
+	if (rc)
+		DSI_DEBUG("failed to parse doze, rc=%d", rc);
+
 	rc = dsi_panel_vreg_get(panel);
 	if (rc) {
 		DSI_ERR("[%s] failed to get panel regulators, rc=%d\n",
@@ -3597,9 +3668,11 @@ struct dsi_panel *dsi_panel_get(struct device *parent,
 	}
 
 	panel->power_mode = SDE_MODE_DPMS_OFF;
+	panel->doze_status = DSI_DOZE_OFF;
 	drm_panel_init(&panel->drm_panel);
 	panel->drm_panel.dev = &panel->mipi_device.dev;
 	panel->mipi_device.dev.of_node = of_node;
+	panel->dsi_refresh_flag = 60;
 
 	rc = drm_panel_add(&panel->drm_panel);
 	if (rc)
@@ -4262,6 +4335,40 @@ error:
 	return rc;
 }
 
+static inline int dsi_panel_switch_doze(struct dsi_panel *panel,
+					enum dsi_doze_type mode)
+{
+	int rc = 0;
+
+	if (panel->doze_status == mode)
+		return rc;
+
+	panel->doze_status = mode;
+	switch (mode) {
+	case DSI_DOZE_OFF:
+		rc = dsi_panel_set_backlight(panel,
+					     panel->bl_config.bl_level_nodim);
+		break;
+	case DSI_DOZE_HBM:
+		rc = dsi_panel_tx_cmd_set(panel, DSI_CMD_SET_DISP_DOZE_HBM);
+		break;
+	case DSI_DOZE_LBM:
+		rc = dsi_panel_tx_cmd_set(panel, DSI_CMD_SET_DISP_DOZE_LBM);
+		break;
+	default:
+		break;
+	}
+
+	return rc;
+}
+
+static int dsi_panel_set_doze(struct dsi_panel *panel, u32 bl_lvl)
+{
+	return dsi_panel_switch_doze(panel, bl_lvl > panel->doze_hbm_threshold ?
+						    DSI_DOZE_HBM :
+						    DSI_DOZE_LBM);
+}
+
 int dsi_panel_set_lp1(struct dsi_panel *panel)
 {
 	int rc = 0;
@@ -4290,6 +4397,10 @@ int dsi_panel_set_lp1(struct dsi_panel *panel)
 	if (rc)
 		DSI_ERR("[%s] failed to send DSI_CMD_SET_LP1 cmd, rc=%d\n",
 		       panel->name, rc);
+
+	rc = dsi_panel_set_doze(panel, panel->bl_config.bl_level_nodim);
+	if (rc)
+		DSI_ERR("[%s] unable to set doze, rc=%d\n", panel->name, rc);
 exit:
 	mutex_unlock(&panel->panel_lock);
 	return rc;
@@ -4312,6 +4423,10 @@ int dsi_panel_set_lp2(struct dsi_panel *panel)
 	if (rc)
 		DSI_ERR("[%s] failed to send DSI_CMD_SET_LP2 cmd, rc=%d\n",
 		       panel->name, rc);
+
+	rc = dsi_panel_set_doze(panel, panel->bl_config.bl_level_nodim);
+	if (rc)
+		DSI_ERR("[%s] unable to set doze, rc=%d\n", panel->name, rc);
 exit:
 	mutex_unlock(&panel->panel_lock);
 	return rc;
@@ -4346,6 +4461,10 @@ int dsi_panel_set_nolp(struct dsi_panel *panel)
 	if (rc)
 		DSI_ERR("[%s] failed to send DSI_CMD_SET_NOLP cmd, rc=%d\n",
 		       panel->name, rc);
+
+	rc = dsi_panel_switch_doze(panel, DSI_DOZE_OFF);
+	if (rc)
+		DSI_ERR("[%s] unable to set doze, rc=%d\n", panel->name, rc);
 exit:
 	mutex_unlock(&panel->panel_lock);
 	return rc;
@@ -4681,6 +4800,17 @@ int dsi_panel_enable(struct dsi_panel *panel)
 		       panel->name, rc);
 	else
 		panel->panel_initialized = true;
+
+	panel->dsi_refresh_flag = 60;
+	if (panel->cur_mode->timing.refresh_rate == 120) {
+		rc = dsi_panel_tx_cmd_set(panel, DSI_CMD_SET_DISP_BC_120HZ);
+		if (unlikely(rc))
+			DSI_ERR("[%s] failed to send DSI_CMD_SET_DISP_BC_120HZ cmd, rc=%d\n",
+				panel->name, rc);
+		else
+			panel->dsi_refresh_flag = 120;
+	}
+
 	mutex_unlock(&panel->panel_lock);
 	return rc;
 }
@@ -4750,6 +4880,7 @@ int dsi_panel_disable(struct dsi_panel *panel)
 
 	/* Avoid sending panel off commands when ESD recovery is underway */
 	if (!atomic_read(&panel->esd_recovery_pending)) {
+		panel->panel_initialized = false;
 		/*
 		 * Need to set IBB/AB regulator mode to STANDBY,
 		 * if panel is going off from AOD mode.
@@ -4774,6 +4905,7 @@ int dsi_panel_disable(struct dsi_panel *panel)
 	}
 	panel->panel_initialized = false;
 	panel->power_mode = SDE_MODE_DPMS_OFF;
+	panel->doze_status = DSI_DOZE_OFF;
 
 	mutex_unlock(&panel->panel_lock);
 	return rc;
@@ -4822,4 +4954,40 @@ int dsi_panel_post_unprepare(struct dsi_panel *panel)
 error:
 	mutex_unlock(&panel->panel_lock);
 	return rc;
+}
+
+inline void dsi_set_backlight_control(struct dsi_panel *panel)
+{
+	int rc;
+	u8 refresh_rate;
+	enum dsi_cmd_set_type cmd = DSI_CMD_SET_DISP_BC_60HZ;
+
+	if (likely(panel->cur_mode->timing.refresh_rate ==
+		   panel->dsi_refresh_flag))
+		return;
+
+	if (unlikely(!panel->panel_initialized)) {
+		DSI_ERR("Invalid params\n");
+		return;
+	}
+
+	mutex_lock(&panel->panel_lock);
+
+	refresh_rate = panel->cur_mode->timing.refresh_rate;
+
+	if (refresh_rate == 120)
+		cmd = DSI_CMD_SET_DISP_BC_120HZ;
+
+	rc = dsi_panel_tx_cmd_set(panel, cmd);
+
+	if (likely(!rc))
+		panel->dsi_refresh_flag = refresh_rate;
+
+	mutex_unlock(&panel->panel_lock);
+
+	if (likely(!rc))
+		DSI_INFO("refresh_rate = %d\n", refresh_rate);
+	else
+		DSI_ERR("failed to send backlight control cmd %d, rc=%d\n",
+			refresh_rate, rc);
 }

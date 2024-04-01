@@ -43,6 +43,7 @@
 #include "sde_hw_qdss.h"
 #include "sde_encoder_dce.h"
 #include "sde_vm.h"
+#include "dsi_display.h"
 
 #define SDE_DEBUG_ENC(e, fmt, ...) SDE_DEBUG("enc%d " fmt,\
 		(e) ? (e)->base.base.id : -1, ##__VA_ARGS__)
@@ -148,69 +149,6 @@ void sde_encoder_uidle_enable(struct drm_encoder *drm_enc, bool enable)
 			phys->hw_ctl->ops.uidle_enable(phys->hw_ctl, enable);
 		}
 	}
-}
-
-static void _sde_encoder_pm_qos_add_request(struct drm_encoder *drm_enc)
-{
-	struct sde_encoder_virt *sde_enc = to_sde_encoder_virt(drm_enc);
-	struct msm_drm_private *priv;
-	struct sde_kms *sde_kms;
-	struct device *cpu_dev;
-	struct cpumask *cpu_mask = NULL;
-	int cpu = 0;
-	u32 cpu_dma_latency;
-
-	priv = drm_enc->dev->dev_private;
-	sde_kms = to_sde_kms(priv->kms);
-
-	if (!sde_kms->catalog || !sde_kms->catalog->perf.cpu_mask)
-		return;
-
-	cpu_dma_latency = sde_kms->catalog->perf.cpu_dma_latency;
-	cpumask_clear(&sde_enc->valid_cpu_mask);
-
-	if (sde_enc->mode_info.frame_rate > DEFAULT_FPS)
-		cpu_mask = to_cpumask(&sde_kms->catalog->perf.cpu_mask_perf);
-	if (!cpu_mask &&
-			sde_encoder_check_curr_mode(drm_enc,
-				MSM_DISPLAY_CMD_MODE))
-		cpu_mask = to_cpumask(&sde_kms->catalog->perf.cpu_mask);
-
-	if (!cpu_mask)
-		return;
-
-	for_each_cpu(cpu, cpu_mask) {
-		cpu_dev = get_cpu_device(cpu);
-		if (!cpu_dev) {
-			SDE_ERROR("%s: failed to get cpu%d device\n", __func__,
-					cpu);
-			return;
-		}
-		cpumask_set_cpu(cpu, &sde_enc->valid_cpu_mask);
-		dev_pm_qos_add_request(cpu_dev,
-				&sde_enc->pm_qos_cpu_req[cpu],
-				DEV_PM_QOS_RESUME_LATENCY, cpu_dma_latency);
-		SDE_EVT32_VERBOSE(DRMID(drm_enc), cpu_dma_latency, cpu);
-	}
-}
-
-static void _sde_encoder_pm_qos_remove_request(struct drm_encoder *drm_enc)
-{
-	struct sde_encoder_virt *sde_enc = to_sde_encoder_virt(drm_enc);
-	struct device *cpu_dev;
-	int cpu = 0;
-
-	for_each_cpu(cpu, &sde_enc->valid_cpu_mask) {
-		cpu_dev = get_cpu_device(cpu);
-		if (!cpu_dev) {
-			SDE_ERROR("%s: failed to get cpu%d device\n", __func__,
-					cpu);
-			continue;
-		}
-		dev_pm_qos_remove_request(&sde_enc->pm_qos_cpu_req[cpu]);
-		SDE_EVT32_VERBOSE(DRMID(drm_enc), cpu);
-	}
-	cpumask_clear(&sde_enc->valid_cpu_mask);
 }
 
 static bool _sde_encoder_is_autorefresh_enabled(
@@ -1543,12 +1481,7 @@ static int _sde_encoder_resource_control_helper(struct drm_encoder *drm_enc,
 
 		/* enable all the irq */
 		sde_encoder_irq_control(drm_enc, true);
-
-		_sde_encoder_pm_qos_add_request(drm_enc);
-
 	} else {
-		_sde_encoder_pm_qos_remove_request(drm_enc);
-
 		/* disable all the irq */
 		sde_encoder_irq_control(drm_enc, false);
 
@@ -1732,7 +1665,6 @@ static int _sde_encoder_rc_kickoff(struct drm_encoder *drm_enc,
 
 	if (is_vid_mode && sde_enc->rc_state == SDE_ENC_RC_STATE_IDLE) {
 		sde_encoder_irq_control(drm_enc, true);
-		_sde_encoder_pm_qos_add_request(drm_enc);
 	} else {
 		/* enable all the clks and resources */
 		ret = _sde_encoder_resource_control_helper(drm_enc,
@@ -1890,7 +1822,6 @@ skip_wait:
 		SDE_ENC_RC_STATE_MODESET, SDE_EVTLOG_FUNC_CASE5);
 
 	sde_enc->rc_state = SDE_ENC_RC_STATE_MODESET;
-	_sde_encoder_pm_qos_remove_request(drm_enc);
 
 end:
 	mutex_unlock(&sde_enc->rc_lock);
@@ -1926,7 +1857,6 @@ static int _sde_encoder_rc_post_modeset(struct drm_encoder *drm_enc,
 			SDE_ENC_RC_STATE_ON, SDE_EVTLOG_FUNC_CASE6);
 
 	sde_enc->rc_state = SDE_ENC_RC_STATE_ON;
-	_sde_encoder_pm_qos_add_request(drm_enc);
 
 end:
 	mutex_unlock(&sde_enc->rc_lock);
@@ -1965,7 +1895,6 @@ static int _sde_encoder_rc_idle(struct drm_encoder *drm_enc,
 
 	if (is_vid_mode) {
 		sde_encoder_irq_control(drm_enc, false);
-		_sde_encoder_pm_qos_remove_request(drm_enc);
 	} else {
 		/* disable all the clks and resources */
 		_sde_encoder_update_rsc_client(drm_enc, false);
@@ -4262,6 +4191,9 @@ static int _sde_encoder_reset_ctl_hw(struct drm_encoder *drm_enc)
 void sde_encoder_kickoff(struct drm_encoder *drm_enc, bool is_error,
 		bool config_changed)
 {
+	static bool has_run;
+	struct dsi_display *display;
+	struct sde_connector *sde_conn;
 	struct sde_encoder_virt *sde_enc;
 	struct sde_encoder_phys *phys;
 	unsigned int i;
@@ -4292,6 +4224,11 @@ void sde_encoder_kickoff(struct drm_encoder *drm_enc, bool is_error,
 		SDE_EVT32(DRMID(drm_enc), i, SDE_EVTLOG_FUNC_CASE1);
 	}
 
+	sde_conn = to_sde_connector(sde_enc->cur_master->connector);
+	display = sde_conn->display;
+	if (likely(display && display->panel))
+		dsi_set_backlight_control(display->panel);
+
 	/* All phys encs are ready to go, trigger the kickoff */
 	_sde_encoder_kickoff_phys(sde_enc, config_changed);
 
@@ -4300,6 +4237,11 @@ void sde_encoder_kickoff(struct drm_encoder *drm_enc, bool is_error,
 		phys = sde_enc->phys_encs[i];
 		if (phys && phys->ops.handle_post_kickoff)
 			phys->ops.handle_post_kickoff(phys);
+	}
+
+	if (unlikely(!has_run)) {
+		has_run = true;
+		_sde_connector_report_panel_dead(sde_conn, false);
 	}
 
 	SDE_ATRACE_END("encoder_kickoff");
@@ -5150,8 +5092,10 @@ int sde_encoder_wait_for_event(struct drm_encoder *drm_enc,
 		}
 
 		if (phys && fn_wait) {
+#ifdef CONFIG_TRACEPOINTS
 			snprintf(atrace_buf, sizeof(atrace_buf),
 				"wait_completion_event_%d", event);
+#endif
 			SDE_ATRACE_BEGIN(atrace_buf);
 			ret = fn_wait(phys);
 			SDE_ATRACE_END(atrace_buf);

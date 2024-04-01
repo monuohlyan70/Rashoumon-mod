@@ -1,3 +1,8 @@
+/*
+ * NOTE: This file has been modified by Sony Corporation.
+ * Modifications are Copyright 2021 Sony Corporation,
+ * and licensed under the license of the file.
+ */
 // SPDX-License-Identifier: GPL-2.0-only
 /*
  * Copyright (c) 2016-2021, The Linux Foundation. All rights reserved.
@@ -29,7 +34,8 @@ const char *migrate_type_names[] = {"GROUP_TO_RQ", "RQ_TO_GROUP",
 #define WINDOW_STATS_MAX		1
 #define WINDOW_STATS_MAX_RECENT_AVG	2
 #define WINDOW_STATS_AVG		3
-#define WINDOW_STATS_INVALID_POLICY	4
+#define WINDOW_STATS_EWMA		4
+#define WINDOW_STATS_INVALID_POLICY	5
 
 #define MAX_NR_CLUSTERS			3
 
@@ -122,12 +128,10 @@ __read_mostly unsigned int sysctl_sched_asym_cap_sibling_freq_match_pct = 100;
 __read_mostly unsigned int sysctl_sched_asym_cap_sibling_freq_match_en;
 static cpumask_t asym_freq_match_cpus = CPU_MASK_NONE;
 
-__read_mostly unsigned int sched_ravg_hist_size = 5;
-
 static __read_mostly unsigned int sched_io_is_busy = 1;
 
 __read_mostly unsigned int sysctl_sched_window_stats_policy =
-	WINDOW_STATS_MAX_RECENT_AVG;
+	WINDOW_STATS_EWMA;
 
 unsigned int sysctl_sched_ravg_window_nr_ticks = (HZ / NR_WINDOWS_PER_SEC);
 
@@ -1123,7 +1127,7 @@ unsigned int sysctl_sched_many_wakeup_threshold = WALT_MANY_WAKEUP_DEFAULT;
  * decayed. The rate of increase and decay could be different based
  * on current count in the bucket.
  */
-static inline void bucket_increase(u8 *buckets, int idx)
+static inline void bucket_increase(u8 *buckets, u16 *bucket_bitmask, int idx)
 {
 	int i, step;
 
@@ -1131,8 +1135,10 @@ static inline void bucket_increase(u8 *buckets, int idx)
 		if (idx != i) {
 			if (buckets[i] > DEC_STEP)
 				buckets[i] -= DEC_STEP;
-			else
+			else {
 				buckets[i] = 0;
+				*bucket_bitmask &= ~BIT_MASK(i);
+			}
 		} else {
 			step = buckets[i] >= CONSISTENT_THRES ?
 						INC_STEP_BIG : INC_STEP;
@@ -1140,6 +1146,7 @@ static inline void bucket_increase(u8 *buckets, int idx)
 				buckets[i] = U8_MAX;
 			else
 				buckets[i] += step;
+			*bucket_bitmask |= BIT_MASK(i);
 		}
 	}
 }
@@ -1175,33 +1182,26 @@ static inline int busy_to_bucket(u32 normalized_rt)
  *
  * A new predicted busy time is returned for task @p based on @runtime
  * passed in. The function searches through buckets that represent busy
- * time equal to or bigger than @runtime and attempts to find the bucket to
- * to use for prediction. Once found, it searches through historical busy
- * time and returns the latest that falls into the bucket. If no such busy
- * time exists, it returns the medium of that bucket.
+ * time equal to or bigger than @runtime and attempts to find the bucket
+ * to use for prediction. Once found, it returns the midpoint of that bucket.
  */
 static u32 get_pred_busy(struct task_struct *p,
-				int start, u32 runtime)
+				int start, u32 runtime, u16 bucket_bitmask)
 {
-	int i;
-	u8 *buckets = p->wts.busy_buckets;
-	u32 *hist = p->wts.sum_history;
 	u32 dmin, dmax;
 	u64 cur_freq_runtime = 0;
-	int first = NUM_BUSY_BUCKETS, final;
+	int first = NUM_BUSY_BUCKETS, final = NUM_BUSY_BUCKETS;
 	u32 ret = runtime;
+	u16 next_mask = bucket_bitmask >> start;
 
 	/* skip prediction for new tasks due to lack of history */
 	if (unlikely(is_new_task(p)))
 		goto out;
 
 	/* find minimal bucket index to pick */
-	for (i = start; i < NUM_BUSY_BUCKETS; i++) {
-		if (buckets[i]) {
-			first = i;
-			break;
-		}
-	}
+	if (next_mask)
+		first = ffs(next_mask) - 1 + start;
+
 	/* if no higher buckets are filled, predict runtime */
 	if (first >= NUM_BUSY_BUCKETS)
 		goto out;
@@ -1220,23 +1220,10 @@ static u32 get_pred_busy(struct task_struct *p,
 	dmax = mult_frac(final + 1, max_task_load(), NUM_BUSY_BUCKETS);
 
 	/*
-	 * search through runtime history and return first runtime that falls
-	 * into the range of predicted bucket.
-	 */
-	for (i = 0; i < sched_ravg_hist_size; i++) {
-		if (hist[i] >= dmin && hist[i] < dmax) {
-			ret = hist[i];
-			break;
-		}
-	}
-	/* no historical runtime within bucket found, use average of the bin */
-	if (ret < dmin)
-		ret = (dmin + dmax) / 2;
-	/*
 	 * when updating in middle of a window, runtime could be higher
 	 * than all recorded history. Always predict at least runtime.
 	 */
-	ret = max(runtime, ret);
+	ret = max(runtime, (dmin + dmax) / 2);
 out:
 	trace_sched_update_pred_demand(p, runtime,
 		mult_frac((unsigned int)cur_freq_runtime, 100,
@@ -1250,7 +1237,7 @@ static inline u32 calc_pred_demand(struct task_struct *p)
 		return p->wts.pred_demand;
 
 	return get_pred_busy(p, busy_to_bucket(p->wts.curr_window),
-			     p->wts.curr_window);
+			     p->wts.curr_window, p->wts.bucket_bitmask);
 }
 
 /*
@@ -1811,8 +1798,8 @@ static inline u32 predict_and_update_buckets(
 		return 0;
 
 	bidx = busy_to_bucket(runtime);
-	pred_demand = get_pred_busy(p, bidx, runtime);
-	bucket_increase(p->wts.busy_buckets, bidx);
+	pred_demand = get_pred_busy(p, bidx, runtime, p->wts.bucket_bitmask);
+	bucket_increase(p->wts.busy_buckets, &p->wts.bucket_bitmask, bidx);
 
 	return pred_demand;
 }
@@ -1869,9 +1856,9 @@ static void update_history(struct rq *rq, struct task_struct *p,
 			 u32 runtime, int samples, int event)
 {
 	u32 *hist = &p->wts.sum_history[0];
-	int ridx, widx;
+	int i;
 	u32 max = 0, avg, demand, pred_demand;
-	u64 sum = 0;
+	u64 sum = 0, ewma = 0, ewma_weight;
 	u16 demand_scaled, pred_demand_scaled;
 
 	/* Ignore windows where task had no activity */
@@ -1879,20 +1866,19 @@ static void update_history(struct rq *rq, struct task_struct *p,
 		goto done;
 
 	/* Push new 'runtime' value onto stack */
-	widx = sched_ravg_hist_size - 1;
-	ridx = widx - samples;
-	for (; ridx >= 0; --widx, --ridx) {
-		hist[widx] = hist[ridx];
-		sum += hist[widx];
-		if (hist[widx] > max)
-			max = hist[widx];
+	for (; samples > 0; samples--) {
+		hist[p->wts.cidx] = runtime;
+		ewma_weight = RAVG_HIST_SIZE - p->wts.cidx - 1;
+		p->wts.cidx = ++(p->wts.cidx) & RAVG_HIST_MASK;
 	}
 
-	for (widx = 0; widx < samples && widx < sched_ravg_hist_size; widx++) {
-		hist[widx] = runtime;
-		sum += hist[widx];
-		if (hist[widx] > max)
-			max = hist[widx];
+	for (i = 0; i < RAVG_HIST_SIZE; i++) {
+		sum += hist[i];
+		ewma += hist[i] << ewma_weight;
+		ewma_weight = (ewma_weight + 1) & RAVG_HIST_MASK;
+
+		if (hist[i] > max)
+			max = hist[i];
 	}
 
 	p->wts.sum = 0;
@@ -1901,8 +1887,29 @@ static void update_history(struct rq *rq, struct task_struct *p,
 		demand = runtime;
 	} else if (sysctl_sched_window_stats_policy == WINDOW_STATS_MAX) {
 		demand = max;
+	} else if (sysctl_sched_window_stats_policy == WINDOW_STATS_EWMA) {
+		/*
+		 * WMA stands for weighted moving average. It helps to
+		 * smooth load curve and react faster while ramping down
+		 * comparing with basic average policy. When ramping up
+		 * it prevents from a spurious big "recent" sample that
+		 * may lead to overshooting if it is bigger than AVG of
+		 * history demand.
+		 *
+		 * See below example (4 HS):
+		 *
+		 * WMA = (P0 * 4 + P1 * 3 + P2 * 2 + P3 * 1) / (4 + 3 + 2 + 1)
+		 *
+		 * This is done for power saving. Means when load disappears
+		 * or becomes low, this algorithm caches a real bottom load
+		 * faster (because of weights) than taking AVG values.
+		 *
+		 * EWMA is an exponential version of the WMA algorithm.
+		 */
+		ewma = div64_u64(ewma, (1 << RAVG_HIST_SIZE) - 1);
+		demand = (u32) ewma;
 	} else {
-		avg = div64_u64(sum, sched_ravg_hist_size);
+		avg = sum >> RAVG_HIST_SHIFT;
 		if (sysctl_sched_window_stats_policy == WINDOW_STATS_AVG)
 			demand = avg;
 		else
@@ -1934,7 +1941,7 @@ static void update_history(struct rq *rq, struct task_struct *p,
 
 	p->wts.demand = demand;
 	p->wts.demand_scaled = demand_scaled;
-	p->wts.coloc_demand = div64_u64(sum, sched_ravg_hist_size);
+	p->wts.coloc_demand = sum >> RAVG_HIST_SHIFT;
 	p->wts.pred_demand = pred_demand;
 	p->wts.pred_demand_scaled = pred_demand_scaled;
 
@@ -2141,7 +2148,7 @@ update_task_rq_cpu_cycles(struct task_struct *p, struct rq *rq, int event,
 	p->wts.cpu_cycles = cur_cycles;
 }
 
-static inline void run_walt_irq_work(u64 old_window_start, struct rq *rq)
+static inline void run_walt_irq_work_rollover(u64 old_window_start, struct rq *rq)
 {
 	u64 result;
 
@@ -2189,7 +2196,7 @@ void walt_update_task_ravg(struct task_struct *p, struct rq *rq, int event,
 done:
 	p->wts.mark_start = wallclock;
 
-	run_walt_irq_work(old_window_start, rq);
+	run_walt_irq_work_rollover(old_window_start, rq);
 }
 
 u32 sched_get_init_task_load(struct task_struct *p)
@@ -2226,12 +2233,10 @@ void init_new_task_load(struct task_struct *p)
 	for (i = 0; i < NUM_BUSY_BUCKETS; ++i)
 		p->wts.busy_buckets[i] = 0;
 
+	p->wts.bucket_bitmask = 0;
 	p->wts.cpu_cycles = 0;
-
-	p->wts.curr_window_cpu = kcalloc(nr_cpu_ids, sizeof(u32),
-					  GFP_KERNEL | __GFP_NOFAIL);
-	p->wts.prev_window_cpu = kcalloc(nr_cpu_ids, sizeof(u32),
-					  GFP_KERNEL | __GFP_NOFAIL);
+	memset(&p->wts.curr_window_cpu, 0, sizeof(u32) * nr_cpu_ids);
+	memset(&p->wts.prev_window_cpu, 0, sizeof(u32) * nr_cpu_ids);
 
 	if (init_load_pct) {
 		init_load_windows = div64_u64((u64)init_load_pct *
@@ -2244,53 +2249,31 @@ void init_new_task_load(struct task_struct *p)
 	p->wts.coloc_demand = init_load_windows;
 	p->wts.pred_demand = 0;
 	p->wts.pred_demand_scaled = 0;
-	for (i = 0; i < RAVG_HIST_SIZE_MAX; ++i)
+	for (i = 0; i < RAVG_HIST_SIZE; ++i)
 		p->wts.sum_history[i] = init_load_windows;
 	p->wts.misfit = false;
 	p->wts.rtg_high_prio = false;
 	p->wts.unfilter = sysctl_sched_task_unfilter_period;
-}
-
-/*
- * kfree() may wakeup kswapd. So this function should NOT be called
- * with any CPU's rq->lock acquired.
- */
-void free_task_load_ptrs(struct task_struct *p)
-{
-	kfree(p->wts.curr_window_cpu);
-	kfree(p->wts.prev_window_cpu);
-
-	/*
-	 * walt_update_task_ravg() can be called for exiting tasks. While the
-	 * function itself ensures correct behavior, the corresponding
-	 * trace event requires that these pointers be NULL.
-	 */
-	p->wts.curr_window_cpu = NULL;
-	p->wts.prev_window_cpu = NULL;
+	p->wts.cidx = 0;
 }
 
 void walt_task_dead(struct task_struct *p)
 {
 	sched_set_group_id(p, 0);
-	free_task_load_ptrs(p);
 }
 
 void reset_task_stats(struct task_struct *p)
 {
 	int i = 0;
-	u32 *curr_window_ptr;
-	u32 *prev_window_ptr;
 
-	curr_window_ptr =  p->wts.curr_window_cpu;
-	prev_window_ptr = p->wts.prev_window_cpu;
-	memset(curr_window_ptr, 0, sizeof(u32) * nr_cpu_ids);
-	memset(prev_window_ptr, 0, sizeof(u32) * nr_cpu_ids);
+	memset(p->wts.curr_window_cpu, 0, sizeof(u32) * nr_cpu_ids);
+	memset(p->wts.prev_window_cpu, 0, sizeof(u32) * nr_cpu_ids);
 
 	p->wts.mark_start = 0;
 	p->wts.sum = 0;
 	p->wts.demand = 0;
 	p->wts.coloc_demand = 0;
-	for (i = 0; i < RAVG_HIST_SIZE_MAX; ++i)
+	for (i = 0; i < RAVG_HIST_SIZE; ++i)
 		p->wts.sum_history[i] = 0;
 	p->wts.curr_window = 0;
 	p->wts.prev_window = 0;
@@ -2300,9 +2283,8 @@ void reset_task_stats(struct task_struct *p)
 	p->wts.demand_scaled = 0;
 	p->wts.pred_demand_scaled = 0;
 	p->wts.active_time = 0;
-
-	p->wts.curr_window_cpu = curr_window_ptr;
-	p->wts.prev_window_cpu = prev_window_ptr;
+	p->wts.cidx = 0;
+	p->wts.bucket_bitmask = 0;
 }
 
 void mark_task_starting(struct task_struct *p)
@@ -2847,7 +2829,7 @@ static void _set_preferred_cluster(struct walt_related_thread_group *grp)
 		}
 
 		if (p->wts.mark_start < wallclock -
-		    (sched_ravg_window * sched_ravg_hist_size))
+		    (sched_ravg_window * RAVG_HIST_SIZE))
 			continue;
 
 		combined_demand += p->wts.coloc_demand;
@@ -3442,19 +3424,28 @@ static void walt_update_irqload(struct rq *rq)
 		rq->wrq.high_irqload = 0;
 }
 
-/*
- * Runs in hard-irq context. This should ideally run just after the latest
- * window roll-over.
+/**
+ * __walt_irq_work_locked() - common function to process work
+ * @is_migration: if true, performing migration work, else rollover
+ * @lock_cpus: mask of the cpus involved in the operation.
+ *
+ * In rq locked context, update the cluster group load and find
+ * the load of the min cluster, while tracking the total aggregate
+ * work load.  Update the cpufreq through the walt governor,
+ * based upon the new load calculated.
+ *
+ * For the window rollover case lock_cpus will be all possible cpus,
+ * and for migrations it will include the cpus from the two clusters
+ * involved in the migration.
  */
-void walt_irq_work(struct irq_work *irq_work)
+static inline void __walt_irq_work_locked(bool is_migration, struct cpumask *lock_cpus)
 {
 	struct walt_sched_cluster *cluster;
 	struct rq *rq;
 	int cpu;
 	u64 wc;
-	bool is_migration = false, is_asym_migration = false;
+	bool is_asym_migration = false;
 	u64 total_grp_load = 0, min_cluster_grp_load = 0;
-	int level = 0;
 	u64 cur_jiffies_ts;
 	unsigned long flags;
 	struct cpumask freq_match_cpus;
@@ -3465,18 +3456,6 @@ void walt_irq_work(struct irq_work *irq_work)
 	else
 		cpumask_copy(&freq_match_cpus, &asym_cap_sibling_cpus);
 
-	/* Am I the window rollover work or the migration work? */
-	if (irq_work == &walt_migration_irq_work)
-		is_migration = true;
-
-	for_each_cpu(cpu, cpu_possible_mask) {
-		if (level == 0)
-			raw_spin_lock(&cpu_rq(cpu)->lock);
-		else
-			raw_spin_lock_nested(&cpu_rq(cpu)->lock, level);
-		level++;
-	}
-
 	wc = sched_ktime_clock();
 	cur_jiffies_ts = get_jiffies_64();
 	walt_load_reported_window = atomic64_read(&walt_irq_work_lastq_ws);
@@ -3484,13 +3463,17 @@ void walt_irq_work(struct irq_work *irq_work)
 		u64 aggr_grp_load = 0;
 
 		raw_spin_lock(&cluster->load_lock);
-
 		for_each_cpu(cpu, &cluster->cpus) {
 			rq = cpu_rq(cpu);
 			if (rq->curr) {
-				walt_update_task_ravg(rq->curr, rq,
-						TASK_UPDATE, wc, 0);
-				account_load_subtractions(rq);
+				/* only update ravg for locked cpus */
+				if (cpumask_intersects(lock_cpus, &cluster->cpus)) {
+					walt_update_task_ravg(rq->curr, rq,
+							      TASK_UPDATE, wc, 0);
+					account_load_subtractions(rq);
+				}
+
+				/* update aggr_grp_load for all clusters, all cpus */
 				aggr_grp_load +=
 					rq->wrq.grp_time.prev_runnable_sum;
 			}
@@ -3500,13 +3483,13 @@ void walt_irq_work(struct irq_work *irq_work)
 				rq->wrq.notif_pending = false;
 			}
 		}
+		raw_spin_unlock(&cluster->load_lock);
 
 		cluster->aggr_grp_load = aggr_grp_load;
 		total_grp_load += aggr_grp_load;
 
 		if (is_min_capacity_cluster(cluster))
 			min_cluster_grp_load = aggr_grp_load;
-		raw_spin_unlock(&cluster->load_lock);
 	}
 
 	if (total_grp_load) {
@@ -3530,11 +3513,15 @@ void walt_irq_work(struct irq_work *irq_work)
 		cpumask_t cluster_online_cpus;
 		unsigned int num_cpus, i = 1;
 
+		/* for migration, skip unnotified clusters */
+		if (is_migration && !cpumask_intersects(lock_cpus, &cluster->cpus))
+			continue;
+
 		cpumask_and(&cluster_online_cpus, &cluster->cpus,
 						cpu_online_mask);
 		num_cpus = cpumask_weight(&cluster_online_cpus);
 		for_each_cpu(cpu, &cluster_online_cpus) {
-			int flag = SCHED_CPUFREQ_WALT;
+			int flag = 0;
 
 			rq = cpu_rq(cpu);
 
@@ -3590,8 +3577,69 @@ void walt_irq_work(struct irq_work *irq_work)
 		}
 		spin_unlock_irqrestore(&sched_ravg_window_lock, flags);
 	}
+}
 
-	for_each_cpu(cpu, cpu_possible_mask)
+/**
+ * irq_work_restrict_to_mig_clusters() - only allow notified clusters
+ * @lock_cpus: mask of the cpus for which the runque should be locked.
+ *
+ * Remove cpus in clusters that are not part of the migration, using
+ * the notif_pending flag to track.
+ *
+ * This is only valid for the migration irq work.
+ */
+static inline void irq_work_restrict_to_mig_clusters(cpumask_t *lock_cpus)
+{
+	struct walt_sched_cluster *cluster;
+	struct rq *rq;
+	int cpu;
+
+	for_each_sched_cluster(cluster) {
+		for_each_cpu(cpu, &cluster->cpus) {
+			rq = cpu_rq(cpu);
+			/* remove this cluster if it's not being notified */
+			if (!rq->wrq.notif_pending) {
+				cpumask_andnot(lock_cpus, lock_cpus, &cluster->cpus);
+				break;
+			}
+		}
+	}
+}
+
+/**
+ * walt_irq_work() - perform walt irq work for rollover and migration
+ *
+ * Process a workqueue call scheduled, while running in a hard irq
+ * protected context.  Handle migration and window rollover work
+ * with common funtionality, and on window rollover ask core control
+ * to decide if it needs to adjust the active cpus.
+ */
+static void walt_irq_work(struct irq_work *irq_work)
+{
+	cpumask_t lock_cpus;
+	int level = 0;
+	int cpu;
+	bool is_migration = false;
+
+	if (irq_work == &walt_migration_irq_work)
+		is_migration = true;
+
+	cpumask_copy(&lock_cpus, cpu_possible_mask);
+
+	if (is_migration)
+		irq_work_restrict_to_mig_clusters(&lock_cpus);
+
+	for_each_cpu(cpu, &lock_cpus) {
+		if (level == 0)
+			raw_spin_lock(&cpu_rq(cpu)->lock);
+		else
+			raw_spin_lock_nested(&cpu_rq(cpu)->lock, level);
+		level++;
+	}
+
+	__walt_irq_work_locked(is_migration, &lock_cpus);
+
+	for_each_cpu(cpu, &lock_cpus)
 		raw_spin_unlock(&cpu_rq(cpu)->lock);
 
 	if (!is_migration)
@@ -3633,7 +3681,7 @@ void walt_fill_ta_data(struct core_ctl_notif_data *data)
 
 	list_for_each_entry(p, &grp->tasks, wts.grp_list) {
 		if (p->wts.mark_start < wallclock -
-		    (sched_ravg_window * sched_ravg_hist_size))
+		    (sched_ravg_window * RAVG_HIST_SIZE))
 			continue;
 
 		total_demand += p->wts.coloc_demand;
