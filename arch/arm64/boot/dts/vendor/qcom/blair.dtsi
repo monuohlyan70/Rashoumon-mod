@@ -1304,6 +1304,12 @@
 				<GIC_SPI 31 IRQ_TYPE_LEVEL_HIGH>;
 		interrupt-names = "dcvsh0_int", "dcvsh1_int";
 		#freq-domain-cells = <2>;
+
+		qcom,cpufreq-table-0 =
+			<1804800>;
+
+		qcom,cpufreq-table-1 =
+			<2208000>;
 	};
 
 	qcom,cpufreq-hw-debug@0fd91000 {
