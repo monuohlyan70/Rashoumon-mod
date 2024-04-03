@@ -1,48 +1,62 @@
-name: Build
-on: [pull_request, workflow_dispatch]
+name: Build veux-kernel
+on: [push, pull_request, workflow_dispatch]
 
 jobs:
   build:
-    name: Bulid Image
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        buildconfig: [ build.config.msm.veux ]
     env:
       CCACHE_COMPILERCHECK: "%compiler% -dumpmachine; %compiler% -dumpversion"
       CCACHE_NOHASHDIR: "true"
       CCACHE_MAXSIZE: "2G"
       CCACHE_HARDLINK: "true"
-      KBUILD_BUILD_USER: "NzTm"
-      KBUILD_BUILD_HOST: "Pendi"
-      
+      KERNEL_DEFCONFIG: "veux_defconfig"
+      KERNEL_CMDLINE: "ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi- O=out LLVM_IAS=1"
     steps:
-    - name: Checkout source
-      uses: actions/checkout@v4
+    - name: Checkout
+      uses: actions/checkout@v3
       with:
-        fetch-depth: 1
-    
-    - name: Setup dependencies
-      run: ./setup_toolchain.sh
+        submodules: 'true'
+        fetch-depth: 0
 
-    - name: Setup ccache
+    - name: Set up ccache
       uses: hendrikmuhs/ccache-action@v1.2
+    
+    - name: Install dependencies
+      id: version
+      run: |
+        sudo apt-get update -y 
+        sudo apt install gcc-aarch64-linux-gnu -y
+        sudo apt install gcc-arm-linux-gnueabi -y
+        sudo apt install binutils make python3 libssl-dev build-essential bc  bison flex zip unzip libssl-dev ca-certificates xz-utils mkbootimg cpio device-tree-compiler git git-lfs -y
+        echo "Fetching LLVM tar"
+        wget https://cdn.kernel.org/pub/tools/llvm/files/llvm-16.0.6-x86_64.tar.xz 
+        echo "Extracting tar"
+        tar -xJf llvm-16.0.6-x86_64.tar.xz
+        echo "Pull submodules"
+        git submodule sync
+        git submodule update --init --recursive
+    
+    - name: GetTime
+      id: get_time
+      run: |
+        echo "TIME=$(TZ=UTC-8 date +%m%d%H%M )" >> $GITHUB_OUTPUT
+    
+    - name: Build Kernel
+      run: |
+       export PATH=$(pwd)/llvm-16.0.6-x86_64/bin/:$PATH
+       export ARCH=arm64
+       export SUBARCH=arm64
+       export KBUILD_BUILD_USER="MONU"
+       export KBUILD_BUILD_HOST="Nightly"
+       export DISABLE_WRAPPER=1
+       make $KERNEL_CMDLINE $KERNEL_DEFCONFIG CC="ccache clang"
+       make $KERNEL_CMDLINE CC="ccache clang" -j$(nproc --all)
+       make $KERNEL_CMDLINE $KERNEL_DEFCONFIG dtbs
+       cp out/arch/arm64/boot/Image AnyKernel3
+       cp out/arch/arm64/boot/dts/vendor/qcom/blair.dtb AnyKernel3/dtb
+
+    - name: Upload Kernel
+      uses: actions/upload-artifact@v3
       with:
-        key: ${{ matrix.buildconfig }}
-
-    - name: Setup ThinLTO cache
-      uses: actions/cache@v4
-      with: 
-        path: ${{ github.workspace }}/out/.thinlto-cache
-        key: thinlto-${{ matrix.buildconfig }}-${{ github.run_id }}
-        restore-keys: thinlto-${{ matrix.buildconfig }}
-
-    - name: Run build
-      run: BUILD_CONFIG=${{ matrix.buildconfig }} build/build.sh CC="ccache clang"
-
-    - name: Upload zip
-      uses: actions/upload-artifact@v4
-      with:
-        name: Rashoumon-mod
-        path: "AnyKernel3/"
+        name: Rashoumon-${{ steps.version.outputs.VER }}-${{ steps.get_time.outputs.TIME }}
+        path: "AnyKernel3/*"
